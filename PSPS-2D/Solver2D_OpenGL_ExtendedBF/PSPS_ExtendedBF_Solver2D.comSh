@@ -1,0 +1,432 @@
+/*************************************
+     Parallel Shortest Path Solver
+             developed by
+ Somrath Kanoksirirath
+ Fourth year physics student,
+ Faculty of Science,
+ Mahidol University, Thailand.
+*************************************/
+
+#version 430 core
+layout(local_size_x=BLOCK_X, local_size_y=BLOCK_Y, local_size_z=1) in;
+
+// Extended Parallel Shortest-Path Ray Tracing on GPU
+// Conventional Square Version
+// with update map (4 barriers)
+// without edge reduction
+
+// Check std::replace at PSPS_OpenGL_2D_Solver.Init()
+#define shared_X SHARED_X
+#define shared_Y SHARED_Y
+#define group_X  GROUP_X
+#define group_Y  GROUP_Y
+#define radius_X RADIUS_X
+#define radius_Y RADIUS_Y
+
+// Data Maps
+layout(binding = 0, r32f) readonly uniform  image2D SlownessMap ;
+layout(binding = 1, r32f) readonly uniform  image2D inTraveltime ;
+layout(binding = 2, r32i) readonly uniform iimage2D inUpdate ;
+
+layout(binding = 3, r32f) writeonly uniform  image2D outTraveltime ;
+layout(binding = 4, r32i) writeonly uniform iimage2D outUpdate ;
+layout(binding = 5, r32i) writeonly uniform iimage2D RaypathMap ;
+
+layout(std430, binding = 6) buffer SSBO{
+     int running ;
+} ssbo ;
+
+// Constant values
+ivec2 shift = ivec2( radius_X, radius_Y ) ;
+
+
+/***** Main program *****/
+
+shared bool isAnyUpdated ;
+shared bool needUpdate   ;
+shared float Slowness[shared_X][shared_Y] ;
+shared float Traveltime[shared_X][shared_Y] ;
+
+// Upload Slowness x4 and Traveltime x4 to shared memory
+void uploadShared()
+{
+	// (1,1)
+    ivec2    ptrMap = ivec2( gl_GlobalInvocationID.xy ) ;
+    ivec2 ptrShared = ivec2( gl_LocalInvocationID.xy ) ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ] = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ] = imageLoad( inTraveltime, ptrMap ).x ;
+
+	// (2,1)
+       ptrMap.x += 2*shift.x ;
+	ptrShared.x += 2*shift.x ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ] = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ] = imageLoad( inTraveltime, ptrMap ).x ;
+
+	 // (2,2)
+	   ptrMap.y += 2*shift.y ;
+	ptrShared.y += 2*shift.y ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ] = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ] = imageLoad( inTraveltime, ptrMap ).x ;
+
+	 // (1,2)
+       ptrMap.x -= 2*shift.x ;
+	ptrShared.x -= 2*shift.x ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ] = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ] = imageLoad( inTraveltime, ptrMap ).x ;
+
+}
+
+
+// Calculate Weight (Slowness*LineWeight)
+float SPR(in const int ix, in const int iy, in const ivec2 Source) // (ix,iy) = relative directional vector wrt. source(posOnShmem)
+{
+    int nX = abs(ix), nY = abs(iy) ;
+	
+	const vec2  fVec   =  vec2( ix, iy) ;
+	const vec2  stride =  vec2( 1.0f/nX, 1.0f/nY ) ;
+
+    float crossX = 1.0f - 0.5f*stride.x ;
+    float crossY = 1.0f - 0.5f*stride.y ;
+	
+	float Weight   = 0 ;	
+	float crossOld = 1.0f ;
+
+
+	// Main process
+	while( 0 < nX || 0 < nY )
+	{
+	    if( crossX < crossY ){
+	        
+	        // Compute weight (Y)
+		    ivec2 index = Source + ivec2( round( 0.5f*(crossOld+crossY)*fVec ) ) ;
+		    Weight += Slowness[index.x][index.y]*(crossOld-crossY) ;
+
+		    // For next crossing point.
+		    crossOld = crossY ;
+		    --nY ;
+		    crossY -= stride.y ;
+	        
+	    }else{
+	    
+	    	// Compute weight (X)
+		    ivec2 index = Source + ivec2( round( 0.5f*(crossOld+crossX)*fVec ) ) ;
+		    Weight += Slowness[index.x][index.y]*(crossOld-crossX) ;
+
+		    // For next crossing point.
+		    crossOld = crossX ;
+		    --nX ;
+		    crossX -= stride.x ;
+	    
+	    }
+
+	}
+	// Weight at source
+	Weight += Slowness[Source.x][Source.y]*crossOld ;
+    Weight *= length( vec2( ix, iy) ) ;
+
+return Weight ; }
+
+/// Calculate new traveltime 
+float FIM(in const float Tx, in const float Ty, in const float S)
+{
+return 0.5f*( Tx+Ty + sqrt(2.0f*pow(S,2) - pow(Tx-Ty,2)) ) ; } // If it is NaN, then newTt<Tt is false anyway.
+
+/// Compare New and Old traveltime
+void compareTraveltime()
+{
+	const ivec2 posWorker = ivec2(gl_LocalInvocationID.xy) + shift ; // posWorker on shMem
+	float Tt = Traveltime[posWorker.x][posWorker.y] ;
+	int rayPath = -100 ;
+    const int stride = int(group_X) ;
+
+	// Start:: Comparing neighbor != (0,0) ***************************************
+    
+    float T1, T2, T3, T4, newTt ;
+        
+    // Node 1 (-2,-1)
+    float Tt1 = SPR(-2,-1,posWorker) ; // is also node 24 
+    newTt = Tt1 + Traveltime[ posWorker.x-2 ][ posWorker.y-1 ] ; 
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-1)+(shift.x-2) ;
+	}
+	
+	// Node 2 (-1,-1)
+	T1 = SPR(-1,-1,posWorker);
+	newTt = T1 + Traveltime[ posWorker.x-1 ][ posWorker.y-1 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-1)+(shift.x-1) ;
+	}
+	
+	// Node 3 (-1,-2)
+	T2 = SPR(-1,-2,posWorker);
+	newTt = T2 + Traveltime[ posWorker.x-1 ][ posWorker.y-2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-2)+(shift.x-1) ;
+	}
+	
+	// Node 4 (-2,-2)
+	newTt = FIM(T2,Tt1, Slowness[posWorker.x-2][posWorker.y-2] )
+	         + Traveltime[ posWorker.x-2 ][ posWorker.y-2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-2)+(shift.x-2) ;
+	}
+	newTt = SPR(-2,-2,posWorker) + Traveltime[ posWorker.x-2 ][ posWorker.y-2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-2)+(shift.x-2) ;
+	}
+	
+	// Node 5 (0,-1)
+	T3 = SPR(0,-1,posWorker);
+	newTt = T3 + Traveltime[ posWorker.x ][ posWorker.y-1 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-1)+(shift.x) ;
+	}
+	
+	// Node 6 (1,-2)
+	T1 = SPR(1,-2,posWorker);
+	newTt = T1 + Traveltime[ posWorker.x+1 ][ posWorker.y-2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-2)+(shift.x+1) ;
+	}
+	
+	// Node 7 (0,-2)
+	newTt = FIM(min(T1,T2),T3, Slowness[posWorker.x][posWorker.y-2] )
+	        + Traveltime[ posWorker.x ][ posWorker.y-2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-2)+(shift.x) ;
+	}
+	newTt = SPR(0,-2,posWorker) + Traveltime[ posWorker.x ][ posWorker.y-2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-2)+(shift.x) ;
+	}
+		
+	// Node 8 (1,-1)
+	T4 = SPR(1,-1,posWorker);
+	newTt = T4 + Traveltime[ posWorker.x+1 ][ posWorker.y-1 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-1)+(shift.x+1) ;
+	}
+	
+	// Node 9 (2,-1)
+	T3 = SPR(2,-1,posWorker);
+	newTt = T3 + Traveltime[ posWorker.x+2 ][ posWorker.y-1 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-1)+(shift.x+2) ;
+	}
+	
+	// Node 10 (2,-2)
+    newTt = FIM(T1,T3, Slowness[posWorker.x+2][posWorker.y-2] )
+	        + Traveltime[ posWorker.x+2 ][ posWorker.y-2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-2)+(shift.x+2) ;
+	}
+	newTt = SPR(2,-2,posWorker) + Traveltime[ posWorker.x+2 ][ posWorker.y-2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y-2)+(shift.x+2) ;
+	}
+	
+	// Node 11 (1,0)
+	T1 = SPR(1,0,posWorker);
+	newTt = T1 + Traveltime[ posWorker.x+1 ][ posWorker.y ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y)+(shift.x+1) ;
+	}
+	
+	// Node 12 (2,1)
+	T4 = SPR(2,1,posWorker);
+	newTt = T4 + Traveltime[ posWorker.x+2 ][ posWorker.y+1 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+1)+(shift.x+2) ;
+	}
+	
+	// Node 13 (2,0)
+	newTt = FIM(T1,min(T3,T4), Slowness[posWorker.x+2][posWorker.y] )
+	         + Traveltime[ posWorker.x+2 ][ posWorker.y ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y)+(shift.x+2) ;
+	}
+	newTt = SPR(2,0,posWorker) + Traveltime[ posWorker.x+2 ][ posWorker.y ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y)+(shift.x+2) ;
+	}
+	
+	// Node 14 (1,1)
+	T2 = SPR(1,1,posWorker);
+	newTt = T2 + Traveltime[ posWorker.x+1 ][ posWorker.y+1 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+1)+(shift.x+1) ;
+	}
+	
+	// Node 15 (1,2)
+	T2 = SPR(1,2,posWorker);
+	newTt = T2 + Traveltime[ posWorker.x+1 ][ posWorker.y+2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+2)+(shift.x+1) ;
+	}
+	
+	// Node 16 (2,2)
+	newTt = FIM(T2,T4, Slowness[posWorker.x+2][posWorker.y+2] )
+	        + Traveltime[ posWorker.x+2 ][ posWorker.y+2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+2)+(shift.x+2) ;
+	}
+	newTt = SPR(2,2,posWorker) + Traveltime[ posWorker.x+2 ][ posWorker.y+2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+2)+(shift.x+2) ;
+	}
+	
+	// Node 17 (0,1)
+	T3 = SPR(0,1,posWorker);
+	newTt = T3 + Traveltime[ posWorker.x ][ posWorker.y+1 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+1)+(shift.x) ;
+	}
+	
+	// Node 18 (-1,2)
+	T1 = SPR(-1,2,posWorker);
+	newTt = T1 + Traveltime[ posWorker.x-1 ][ posWorker.y+2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+2)+(shift.x-1) ;
+	}
+	
+	// Node 19 (0,2)
+	newTt = FIM(min(T1,T2),T3, Slowness[posWorker.x][posWorker.y+2] )
+	        + Traveltime[ posWorker.x ][ posWorker.y+2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+2)+(shift.x) ;
+	}
+	newTt = SPR(0,2,posWorker) + Traveltime[ posWorker.x ][ posWorker.y+2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+2)+(shift.x) ;
+	}
+	
+	// Node 20 (-1,1)
+	T2 = SPR(-1,1,posWorker);
+	newTt = T2 + Traveltime[ posWorker.x-1 ][ posWorker.y+1 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+1)+(shift.x-1) ;
+	}
+	
+	// Node 21 (-2,1)
+	T3 = SPR(-2,1,posWorker);
+	newTt = T3 + Traveltime[ posWorker.x-2 ][ posWorker.y+1 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+1)+(shift.x-2) ;
+	}
+	
+	// Node 22 (-2,2)
+	newTt = FIM(T1,T3, Slowness[posWorker.x-2][posWorker.y+2] )
+	        + Traveltime[ posWorker.x-2 ][ posWorker.y+2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+2)+(shift.x-2) ;
+	}
+	newTt = SPR(-2,2,posWorker) + Traveltime[ posWorker.x-2 ][ posWorker.y+2 ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y+2)+(shift.x-2) ;
+	}
+	
+	// Node 23 (-1,0)
+	T1 = SPR(-1,0,posWorker);
+	newTt = T1 + Traveltime[ posWorker.x-1 ][ posWorker.y ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y)+(shift.x-1) ;
+	}
+	
+	// Node 24==1 (-2,-1)
+	
+	// Node 25 (-2,0)
+	newTt = FIM(T1,min(T3,Tt1), Slowness[posWorker.x-2][posWorker.y] )
+	        + Traveltime[ posWorker.x-2 ][ posWorker.y ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y)+(shift.x-2) ;
+	}
+	newTt = SPR(-2,0,posWorker) + Traveltime[ posWorker.x-2 ][ posWorker.y ] ;
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = stride*(shift.y)+(shift.x-2) ;
+	}
+
+    // End:: Comparing neighbor != (0,0) ***************************************
+
+	// Write outTraveltime
+	imageStore( outTraveltime, ivec2( gl_GlobalInvocationID.xy+shift ), vec4( Tt, 0,0,0) );
+
+	// if threadUpdate -> isAnyUpdated = true ;
+	if( rayPath != -100 ){
+        isAnyUpdated = true ;
+        imageStore( RaypathMap, ivec2( gl_GlobalInvocationID.xy ), ivec4( rayPath, 0,0,0) );
+	}
+
+}
+
+void main()
+{
+
+	/// Need update ?
+	if( gl_LocalInvocationIndex==0 ){
+		needUpdate   = false ;
+		isAnyUpdated = false ;
+	}
+	memoryBarrierShared(); barrier();
+    if(  all(lessThan( gl_LocalInvocationID.xy, uvec2(3,3) ))  ){
+        if( bool( imageLoad( inUpdate, ivec2(gl_WorkGroupID.xy+gl_LocalInvocationID.xy) ).x ) ){
+            needUpdate = true ;
+        }
+	}
+	memoryBarrierShared(); barrier();
+	if( !needUpdate ){ return; }
+
+
+
+	/// Upload Slowness x4 and Traveltime x4 to shared memory
+	uploadShared();
+	memoryBarrierShared(); barrier();
+
+	/// Compare New and Old traveltime
+	compareTraveltime();
+	memoryBarrierShared(); barrier();
+
+
+
+	/// IsUpdate ? -> update running and UpdateMap.
+	if( gl_LocalInvocationIndex==0 ){
+        if( isAnyUpdated ){
+            ++ssbo.running ;
+            //atomicAdd(ssbo.running,1);
+        }
+		imageStore( outUpdate, ivec2( gl_WorkGroupID.x+1, gl_WorkGroupID.y+1 ),  ivec4( isAnyUpdated,0,0,0) );
+	}
+
+
+}

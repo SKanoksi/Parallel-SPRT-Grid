@@ -1,0 +1,139 @@
+/*************************************
+     Parallel Shortest Path Solver
+             developed by
+ Somrath Kanoksirirath
+ Fourth year physics student,
+ Faculty of Science,
+ Mahidol University, Thailand.
+*************************************/
+
+#version 430 core
+layout(local_size_x=BLOCK_X, local_size_y=BLOCK_Y, local_size_z=1) in;
+
+// Conventional Square Version
+// with update map (4 barriers)
+
+// Check std::replace at PSPS_OpenGL_FIM_2D_Solver.Init()
+#define shared_X SHARED_X
+#define shared_Y SHARED_Y
+#define block_X BLock_X
+#define block_Y BLock_Y
+#define scale_X STRIDE_X
+#define scale_Y STRIDE_Y
+#define IterPerBlock ITERPERBLOCK
+
+// Data Maps
+layout(binding = 0, r32f) readonly uniform  image2D SlownessMap ;
+layout(binding = 1, r32f) readonly uniform  image2D inTraveltime ;
+layout(binding = 2, r32i) readonly uniform iimage2D inUpdate ;
+
+layout(binding = 3, r32f) writeonly uniform  image2D outTraveltime ;
+layout(binding = 4, r32i) writeonly uniform iimage2D outUpdate ;
+
+layout(std430, binding = 6) buffer SSBO{
+     int running ;
+} ssbo ;
+
+// Constant values
+//const ivec2 shift = ivec2( radius_X, radius_Y ) ;
+
+
+/***** Main program *****/
+
+shared bool isBCUpdated  ;
+shared bool needUpdate   ;
+shared float   Slowness[shared_X][shared_Y] ;
+shared float Traveltime[shared_X][shared_Y] ;
+
+void main()
+{
+
+	/// Need update ? (4 Neighbor)
+	if( gl_LocalInvocationIndex==0 ){
+		needUpdate   = false ;
+		isBCUpdated = false ;
+	}
+	memoryBarrierShared(); barrier();
+    if(  all(lessThan( gl_LocalInvocationID.xy, uvec2(3,3) )) && any(equal( gl_LocalInvocationID.xy, uvec2(1,1) ))  ){
+        if( bool( imageLoad( inUpdate, ivec2(gl_WorkGroupID.xy+gl_LocalInvocationID.xy) ).x ) ){
+            needUpdate = true ;
+        }
+	}
+	memoryBarrierShared(); barrier();
+	if( !needUpdate ){ return; } // ### ?
+
+
+	/// Upload Slowness and Traveltime to shared memory
+    const ivec2 ptrMap = ivec2( gl_GlobalInvocationID.xy ) + ivec2(1,1) ;
+    const ivec2 ptr    = ivec2( gl_LocalInvocationID.xy )  + ivec2(1,1) ;
+	  Slowness[ ptr.x ][ ptr.y ] = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptr.x ][ ptr.y ] = imageLoad( inTraveltime, ptrMap ).x ;
+	if( ptr.x == 1  )
+	    Traveltime[ 0 ][ ptr.y ]         = imageLoad( inTraveltime, ivec2(ptrMap.x-1,ptrMap.y) ).x ;
+	if( ptr.x == block_X )
+	    Traveltime[ block_X+1 ][ ptr.y ] = imageLoad( inTraveltime, ivec2(ptrMap.x+1,ptrMap.y) ).x ;
+	if( ptr.y == 1  )
+	    Traveltime[ ptr.x ][ 0 ]         = imageLoad( inTraveltime, ivec2(ptrMap.x,ptrMap.y-1) ).x ;
+	if( ptr.y == block_Y )
+	    Traveltime[ ptr.x ][ block_Y+1 ] = imageLoad( inTraveltime, ivec2(ptrMap.x,ptrMap.y+1) ).x ;
+    
+    memoryBarrierShared(); barrier(); // ###
+
+	
+	/// Get TT, Tx, Ty, S 
+	float TT, Tx, Ty, S ;
+	// TT, X
+	 S =   Slowness[ ptr.x ][ ptr.y ] ;
+	TT = Traveltime[ ptr.x ][ ptr.y ] ;
+	
+	/// Compare New and Old traveltime
+	// IterPerBlock 
+	int i ;
+	for( i=0 ; i<IterPerBlock ; ++i )
+	{
+	    Tx = min( Traveltime[ ptr.x-1 ][ ptr.y ], Traveltime[ ptr.x+1 ][ ptr.y ] );
+	    Ty = min( Traveltime[ ptr.x ][ ptr.y-1 ], Traveltime[ ptr.x ][ ptr.y+1 ] );
+	    
+	    memoryBarrierShared(); barrier(); // ###
+	    
+	    /// Calculate new traveltime 
+	    float temp ;
+	    if(Tx < Ty){ temp = Tx ; Tx = Ty ; Ty = temp ; }
+	    float newTT = Ty + S ;
+	    // hx = hy Version, already included in S, (adding and removing dummy vertices)
+	    // Let Tx > Ty
+	    if( 1.414213f*S > Tx-Ty ) 
+	    {	
+	    	temp = 0.5f*( (Tx+Ty) + sqrt( 2.0f*pow(S,2) - pow(Tx-Ty,2) ) ) ;
+	    	if(temp > Tx){ newTT = temp; }
+	    }
+    	if( TT-newTT > 1e-10*newTT ) // Update, if less and relative change is more than 1e-10.
+	    {
+    	    TT = newTT ;
+	        Traveltime[ ptr.x ][ ptr.y ] = TT ;
+	        //if( ptr.x==1 || ptr.x==block_X || ptr.y==1 || ptr.y==block_Y )
+	            isBCUpdated = true ;  
+	    }
+	    
+	    memoryBarrierShared(); barrier(); // ###
+	
+	}
+	
+	// Write outTraveltime
+	imageStore( outTraveltime, ptrMap, vec4( TT, 0,0,0) );
+
+
+	/// IsUpdate ? -> update running and UpdateMap.
+	if( gl_LocalInvocationIndex==0 ){
+        if( isBCUpdated ){
+            ++ssbo.running ;
+            //atomicAdd(ssbo.running,1);
+        }
+		imageStore( outUpdate, ivec2( gl_WorkGroupID.x+1, gl_WorkGroupID.y+1 ),  ivec4( isBCUpdated,0,0,0) );
+	}
+
+
+}
+
+
+

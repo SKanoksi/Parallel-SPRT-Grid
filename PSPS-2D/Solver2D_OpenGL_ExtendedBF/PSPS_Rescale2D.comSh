@@ -1,0 +1,25 @@
+/*************************************
+     Parallel Shortest Path Solver
+             developed by
+ Somrath Kanoksirirath
+ Fourth year physics student,
+ Faculty of Science,
+ Mahidol University, Thailand.
+*************************************/
+
+#version 430 core
+layout(local_size_x=BLOCK_X, local_size_y=BLOCK_Y, local_size_z=1) in;
+
+#define resX RES_X
+#define resY RES_Y
+
+uniform sampler2D inMap ;
+
+layout(binding = 0, r32f) writeonly uniform image2D outMap ;
+
+void main()
+{
+	ivec2 posMap = ivec2( gl_GlobalInvocationID.xy);
+
+	imageStore(outMap, posMap.xy, vec4( texture(inMap, vec2( (2.0f*posMap.x+1.0f)/(2.0f*resX) , (2.0f*posMap.y+1.0f)/(2.0f*resY) ) ).x , 0.0f, 0.0f, 0.0f) );
+}
