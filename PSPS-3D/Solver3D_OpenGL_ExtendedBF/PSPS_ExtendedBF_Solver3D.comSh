@@ -1,0 +1,684 @@
+/*************************************
+     Parallel Shortest path solver
+             developed by
+ Somrath Kanoksirirath
+ Fourth year physics student,
+ Faculty of Science,
+ Mahidol University, Thailand.
+*************************************/
+
+#version 430 core
+layout(local_size_x=BLOCK_X, local_size_y=BLOCK_Y, local_size_z=BLOCK_Z) in;
+
+// Check std::replace at PSPS_OpenGL_3D_Solver.Init()
+#define shared_X SHARED_X
+#define shared_Y SHARED_Y
+#define shared_Z SHARED_Z
+#define group_X  GROUP_X
+#define group_Y  GROUP_Y
+#define group_Z  GROUP_Z
+#define radius_X RADIUS_X
+#define radius_Y RADIUS_Y
+#define radius_Z RADIUS_Z
+
+// Data Maps
+layout(binding = 0, r32f) readonly uniform  image3D SlownessMap ;
+layout(binding = 1, r32f) readonly uniform  image3D inTraveltime ;
+layout(binding = 2, r32i) readonly uniform iimage3D inUpdate ;
+
+layout(binding = 3, r32f) writeonly uniform  image3D outTraveltime ;
+layout(binding = 4, r32i) writeonly uniform iimage3D outUpdate ;
+layout(binding = 5, r32i) writeonly uniform iimage3D RaypathMap ;
+
+layout(std430, binding = 6) buffer SSBO{
+     int running ;
+} ssbo ;
+
+// Constant values
+ivec3 shift = ivec3( radius_X, radius_Y, radius_Z) ;
+
+
+/***** Main program *****/
+
+shared bool isAnyUpdated ;
+shared bool needUpdate  ;
+shared float Slowness[shared_X][shared_Y][shared_Z] ;
+shared float Traveltime[shared_X][shared_Y][shared_Z] ;
+
+// Upload Slowness x8 and Traveltime x8 to shared memory
+void uploadShared()
+{
+	// (1,1,1)
+    ivec3    ptrMap = ivec3( gl_GlobalInvocationID ) ;
+    ivec3 ptrShared = ivec3( gl_LocalInvocationID ) ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ] = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	// (2,1,1)
+       ptrMap.x += 2*shift.x ;
+	ptrShared.x += 2*shift.x ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	 // (2,2,1)
+	   ptrMap.y += 2*shift.y ;
+	ptrShared.y += 2*shift.y ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	 // (1,2,1)
+       ptrMap.x -= 2*shift.x ;
+	ptrShared.x -= 2*shift.x ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	/*********************************************************/
+	
+	// (1,2,2)
+	   ptrMap.z += 2*shift.z ;
+	ptrShared.z += 2*shift.z ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	// (2,2,2)
+       ptrMap.x += 2*shift.x ;
+	ptrShared.x += 2*shift.x ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	 // (2,1,1)
+	   ptrMap.y -= 2*shift.y ;
+	ptrShared.y -= 2*shift.y ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	 // (1,1,1)
+       ptrMap.x -= 2*shift.x ;
+	ptrShared.x -= 2*shift.x ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+	
+}
+
+// Calculate Weight (Slowness*LineWeight)
+float SPR(in const int ix, in const int iy, in const int iz, in const ivec3 Source) // (ix,iy,iz) = relative directional vector wrt. source(posOnShmem)
+{
+	int nX = abs(ix), nY = abs(iy), nZ = abs(iz) ;
+	
+	const vec3  fVec   =  vec3( ix, iy, iz) ;
+	const vec3  stride =  vec3( 1.0f/nX, 1.0f/nY, 1.0f/nZ ) ;
+	
+    float crossX = 1.0f - 0.5f*stride.x ;  
+	float crossY = 1.0f - 0.5f*stride.y ;  
+	float crossZ = 1.0f - 0.5f*stride.z ;
+	
+	float crossOld = 1.0f ;
+	float Weight = 0 ;
+
+	// Main process
+	while( 0 < nX || 0 < nY || 0 < nZ )
+	{
+		int next = 2 ;
+        if( crossY < crossX ){            
+            if( crossZ < crossX ){ next = 0 ; }
+        }else{
+            if( crossZ < crossY ){ next = 1 ; }
+        }
+
+		// Find the next largest crossing point wrt. crossOld	 
+		if( next==0 ){
+			
+			// Compute weight.
+			ivec3 index = Source + ivec3( round( 0.5f*(crossOld+crossX)*fVec ) ) ;
+			Weight += Slowness[index.x][index.y][index.z]*(crossOld-crossX) ;
+
+			// For next crossing point.
+			crossOld = crossX ;
+			--nX ;
+			crossX -= stride.x ;
+			
+		}else{
+		    if( next==1 ){
+			
+			// Compute weight.
+			ivec3 index = Source + ivec3( round( 0.5f*(crossOld+crossY)*fVec ) ) ;
+			Weight += Slowness[index.x][index.y][index.z]*(crossOld-crossY) ;
+
+			// For next crossing point.
+			crossOld = crossY ;
+			--nY ;
+			crossY -= stride.y ;
+			
+			}else{
+			// if next == 2 
+			
+			// Compute weight.
+			ivec3 index = Source + ivec3( round( 0.5f*(crossOld+crossZ)*fVec ) ) ;
+			Weight += Slowness[index.x][index.y][index.z]*(crossOld-crossZ) ;
+
+			// For next crossing point.
+			crossOld = crossZ ;
+			--nZ ;
+			crossZ -= stride.z ;
+		
+		    }
+        }
+		
+	}
+	
+	// Weight at source
+	Weight += Slowness[Source.x][Source.y][Source.z]*crossOld ;
+    Weight *= length( vec3( ix , iy, iz ) ) ;
+
+return Weight ;}
+
+/// Calculate new traveltime 
+float FIM(in float Tx, in float Ty, in float Tz, in const float S)
+{     
+    float TT = 3.0f*pow(S,2) -pow(Tx-Ty,2)-pow(Tx-Tz,2)-pow(Ty-Tz,2) ;
+    if( TT < 0 )
+    {
+        // Let Tx = Largest (use TT as temp)
+        if(Tx < Ty){ TT = Tx ; Tx = Ty ; Ty = TT ; } 
+	    if(Tx < Tz){ TT = Tx ; Tx = Tz ; Tz = TT ; }	
+	    TT = 0.5f*( Ty+Tz + sqrt(2.0f*pow(S,2) - pow(Ty-Tz,2)) ) ; 
+	    
+    }else{
+ 
+        TT = ( Tx+Ty+Tz + sqrt(TT) )/3.0f ; 
+ 
+    } 
+    	   
+return TT ; } // If it is NaN, then newTt<Tt is false anyway.
+
+// Greatest Common Divisor for edge reduction
+int GCD(int a, int b)
+{
+    a = abs(a) ;
+    b = abs(b) ;
+    int c ;
+    while( a!=0 )
+    {
+        c = a ;
+        a = b%a ;
+        b = c ;
+    }
+
+return b; }
+
+
+// Global variables !!!
+float Tt ;
+int rayPath ;
+ivec3 posWorker ;
+ivec2 stride = ivec2(group_X, group_Y) ;
+
+void checkTraveltime(int i, int j, int k, float weight)
+{
+    float newTt = weight + Traveltime[ posWorker.x+i ][ posWorker.y+j ][ posWorker.z+k ] ; 
+    if( newTt<Tt ){
+		Tt = newTt ;
+		rayPath = ( (shift.z+k)*stride.y + (shift.y+j) )*stride.x + (shift.x+i) ;
+	}
+
+}
+
+/// Compare New and Old traveltime
+void compareTraveltime()
+{
+	posWorker = ivec3(gl_LocalInvocationID) + shift ; // posWorker on shMem
+	Tt = Traveltime[posWorker.x][posWorker.y][posWorker.z] ;
+	rayPath = -100 ;
+
+	// Start:: Comparing neighbor != (0,0,0) ***************************************
+    
+	//-----------------------------------------------------------------------
+	float  T1, T2,  T3,  T4, T5, Tt1 ;
+	float Tz1, Tz2, Tz3, Tz4 ;
+	float Tz5, Tz6, Tz7, Tz8 ;
+	float Te1, Te2, Te3 ;
+	
+    // As 2D, START:: Level z = -2 ------------------------------------------
+
+          Tt1 = SPR(-2,-1,-2, posWorker); 
+    checkTraveltime(-2,-1,-2, Tt1); 
+
+	checkTraveltime(-1,-1,-2, SPR(-1,-1,-2, posWorker));	
+
+	      T1  = SPR(-1,-2,-2, posWorker); 
+	checkTraveltime(-1,-2,-2,  T1);	
+
+	      T5  = SPR(-2,-2,-1, posWorker); 
+	      Tz1 = T5 ;
+	checkTraveltime(-2,-2,-1,  T5);
+
+	checkTraveltime(-2,-2,-2, FIM(T1,Tt1,T5, Slowness[posWorker.x-2][posWorker.y-2][ posWorker.z-2 ] ));
+	checkTraveltime(-2,-2,-2, SPR(-2,-2,-2, posWorker));
+	
+	// -----------------
+	
+	      T2  = SPR(0,-1,-2, posWorker);
+	      Te1 = T2 ;  
+	checkTraveltime(0,-1,-2,  T2);
+
+	      T3  = SPR(1,-2,-2, posWorker); 
+	checkTraveltime(1,-2,-2,  T3);
+
+	      T5  = SPR(0,-2,-1, posWorker);
+	      Tz5 = T5 ; 
+	checkTraveltime(0,-2,-1,  T5);
+
+    checkTraveltime(0,-2,-2, FIM(min(T1,T3),T2,T5 , Slowness[posWorker.x][posWorker.y-2][ posWorker.z-2 ] ));
+    checkTraveltime(0,-2,-2, SPR(0,-2,-2, posWorker));
+
+    // -----------------
+
+	checkTraveltime(1,-1,-2, SPR(1,-1,-2, posWorker));
+	
+	      T1  = SPR(2,-1,-2, posWorker); 
+	checkTraveltime(2,-1,-2,  T1);
+	
+	      T5  = SPR(2,-2,-1, posWorker); 
+	      Tz2 = T5 ;
+	checkTraveltime(2,-2,-1,  T5);
+
+    checkTraveltime(2,-2,-2, FIM(T3,T1,T5 , Slowness[posWorker.x+2][posWorker.y-2][ posWorker.z-2 ] ));   
+    checkTraveltime(2,-2,-2, SPR(2,-2,-2, posWorker));
+	
+	// -----------------
+	 
+	      T2  = SPR(1,0,-2, posWorker); 
+	      Te2 = T2 ; 
+	checkTraveltime(1,0,-2,  T2);
+	
+	      T3  = SPR(2,1,-2, posWorker); 
+	checkTraveltime(2,1,-2,  T3);
+	
+	      T5  = SPR(2,0,-1, posWorker); 
+	      Tz6 = T5 ;
+	checkTraveltime(2,0,-1,  T5);
+
+    checkTraveltime(2,0,-2, FIM(T2,min(T1,T3),T5 , Slowness[posWorker.x+2][posWorker.y][ posWorker.z-2 ] ));   
+    checkTraveltime(2,0,-2, SPR(2,0,-2, posWorker));
+ 
+    // -----------------
+
+	checkTraveltime(1,1,-2, SPR(1,1,-2, posWorker));
+	
+	      T1  = SPR(1,2,-2, posWorker); 
+	checkTraveltime(1,2,-2,  T1);
+	
+	      T5  = SPR(2,2,-1, posWorker);
+	      Tz3 = T5 ; 
+	checkTraveltime(2,2,-1,  T5);
+
+    checkTraveltime(2,2,-2, FIM(T1,T3,T5 , Slowness[posWorker.x+2][posWorker.y+2][ posWorker.z-2 ] ));   
+    checkTraveltime(2,2,-2, SPR(2,2,-2, posWorker));
+   
+    // -----------------
+   
+	      T2  = SPR( 0,1,-2, posWorker);
+	      Te3 = T2 ; 
+	checkTraveltime( 0,1,-2, T2);
+	
+	      T3  = SPR(-1,2,-2, posWorker); 
+	checkTraveltime(-1,2,-2, T3);
+	
+          T5  = SPR( 0,2,-1, posWorker); 
+          Tz7 = T5 ;
+	checkTraveltime( 0,2,-1, T5);
+
+    checkTraveltime( 0,2,-2, FIM(min(T1,T3),T2,T5 , Slowness[posWorker.x][posWorker.y+2][ posWorker.z-2 ] ));   
+    checkTraveltime( 0,2,-2, SPR(0,2,-2, posWorker));
+   
+    // -----------------
+	
+	checkTraveltime(-1,1,-2, SPR(-1,1,-2, posWorker));
+	
+	      T1  = SPR(-2,1,-2, posWorker); 
+	checkTraveltime(-2,1,-2, T1);
+	
+	      T5  = SPR(-2,2,-1, posWorker); 
+	      Tz4 = T5 ;
+	checkTraveltime(-2,2,-1, T5);
+
+    checkTraveltime(-2,2,-2, FIM(T3,T1,T5 , Slowness[posWorker.x-2][posWorker.y+2][ posWorker.z-2 ] ));   
+    checkTraveltime(-2,2,-2, SPR(-2,2,-2, posWorker));
+	
+	// -----------------
+	
+	      T2  = SPR(-1,0,-2, posWorker); 
+	checkTraveltime(-1,0,-2, T2);
+	
+	      T5  = SPR(-2,0,-1, posWorker); 
+	      Tz8 = T5 ;
+	checkTraveltime(-2,0,-1, T5);
+	
+	checkTraveltime(-2,0,-2, FIM(T2,min(T1,Tt1),T5 , Slowness[posWorker.x-2][posWorker.y][ posWorker.z-2 ] ));   
+    checkTraveltime(-2,0,-2, SPR(-2,0,-2, posWorker));
+    
+    // -----------------
+    // Special node (0,0)
+    
+    	  T4  = SPR(0,0,-1, posWorker);
+    checkTraveltime(0,0,-1, T4);
+    
+    checkTraveltime(0,0,-2, FIM(min(T2,Te2),min(Te1,Te3), T4, Slowness[posWorker.x][posWorker.y][ posWorker.z-2 ] )); 
+	checkTraveltime(0,0,-2, SPR(0,0,-2, posWorker));
+
+    // As 2D,   END:: Level z = -2 ------------------------------------------
+   	// As 2D, START:: Level z = -1 ------------------------------------------
+
+    // Comparing neighbor (With edge reduction)
+	// For node (i,j,-1) except (0,0,-1) 
+	for(int j = -radius_Y ; j<=radius_Y ; ++j )
+	{
+		for(int i = -radius_X ; i <= radius_X ; ++i )
+		{
+		    if( GCD(i,j)==1 )
+		    {
+                checkTraveltime(i,j,-1, SPR(i,j,-1, posWorker));
+		    }
+		}
+	}
+ 
+    // As 2D,   END:: Level z = -1 ------------------------------------------
+    // As 2D, START:: Level z =  0 ------------------------------------------
+ 
+ 
+          Tt1 = SPR(-2,-1,0, posWorker); 
+    checkTraveltime(-2,-1,0, Tt1); 
+
+	checkTraveltime(-1,-1,0, SPR(-1,-1,0, posWorker));	
+
+	      T1  = SPR(-1,-2,0, posWorker); 
+	checkTraveltime(-1,-2,0,  T1);	
+
+          T2  = Tz1 ;
+	      T5  = SPR(-2,-2,1, posWorker); 
+	      Tz1 = T5 ;
+	checkTraveltime(-2,-2,1,  T5);
+
+	checkTraveltime(-2,-2,0, FIM(T1,Tt1,min(T2,T5), Slowness[posWorker.x-2][posWorker.y-2][ posWorker.z ] ));
+	checkTraveltime(-2,-2,0, SPR(-2,-2,0, posWorker));
+	
+	// -----------------
+	
+	      T3  = SPR(0,-1,0, posWorker);
+	checkTraveltime(0,-1,0,  T3);
+
+	      T4  = SPR(1,-2,0, posWorker); 
+	checkTraveltime(1,-2,0,  T4 );
+
+          T2  = Tz5 ; 
+	      T5  = SPR(0,-2,1, posWorker);
+	      Tz5 = T5 ; 
+	checkTraveltime(0,-2,1,  T5);
+	
+    checkTraveltime(0,-2,0, FIM(min(T1,T4),T3,min(T2,T5), Slowness[posWorker.x][posWorker.y-2][ posWorker.z ] )); 
+    checkTraveltime(0,-2,0, SPR(0,-2,0, posWorker));
+
+    // -----------------
+
+	checkTraveltime(1,-1,0, SPR(1,-1,0, posWorker));
+	
+	      T1  = SPR(2,-1,0, posWorker); 
+	checkTraveltime(2,-1,0,  T1);
+	
+	      T2  = Tz2 ;
+	      T5  = SPR(2,-2,1, posWorker);
+	      Tz2 = T5 ; 
+	checkTraveltime(2,-2,1,  T5);
+
+    checkTraveltime(2,-2,0, FIM(T4,T1,min(T2,T5) , Slowness[posWorker.x+2][posWorker.y-2][ posWorker.z ] ));   
+    checkTraveltime(2,-2,0, SPR(2,-2,0, posWorker));
+	
+	// -----------------
+	     
+	      T3  = SPR(1,0,0, posWorker);
+	checkTraveltime(1,0,0,  T3);
+	
+	      T4  = SPR(2,1,0, posWorker); 
+	checkTraveltime(2,1,0,  T4);
+ 
+          T2  = Tz6 ; 
+	      T5  = SPR(2,0,1, posWorker); 
+	      Tz6 = T5 ;
+	checkTraveltime(2,0,1,  T5);
+ 
+  	checkTraveltime(2,0,0, FIM(T3,min(T1,T4),min(T2,T5), Slowness[posWorker.x+2][posWorker.y][ posWorker.z ] )); 
+    checkTraveltime(2,0,0, SPR(2,0,0, posWorker));
+ 
+    // -----------------
+
+	checkTraveltime(1,1,0, SPR(1,1,0, posWorker));
+	
+	      T1  = SPR(1,2,0, posWorker); 
+	checkTraveltime(1,2,0,  T1);
+	
+	      T2  = Tz3 ;
+	      T5  = SPR(2,2,1, posWorker); 
+	      Tz3 = T5 ;
+	checkTraveltime(2,2,1,  T5);
+
+    checkTraveltime(2,2,0, FIM(T1,T4,min(T2,T5) , Slowness[posWorker.x+2][posWorker.y+2][ posWorker.z ] ));   
+    checkTraveltime(2,2,0, SPR(2,2,0, posWorker));
+   
+    // -----------------
+   
+          T3  = SPR( 0,1,0, posWorker);
+	checkTraveltime( 0,1,0, T3);
+	
+	      T4  = SPR(-1,2,0, posWorker); 
+	checkTraveltime(-1,2,0, T4);
+	
+	      T2  = Tz7 ; 
+	      T5  = SPR( 0,2,1, posWorker); 
+	      Tz7 = T5 ;
+	checkTraveltime( 0,2,1,  T5);
+ 
+ 	checkTraveltime( 0,2,0, FIM(min(T1,T4),T3,min(T2,T5), Slowness[posWorker.x][posWorker.y+2][ posWorker.z ] )); 
+    checkTraveltime( 0,2,0, SPR(0,2,0, posWorker));
+   
+    // -----------------
+	
+	checkTraveltime(-1,1,0, SPR(-1,1,0, posWorker));
+	
+	      T1  = SPR(-2,1,0, posWorker); 
+	checkTraveltime(-2,1,0, T1);
+	
+	      T2  = Tz4 ; 
+	      T5  = SPR(-2,2,1, posWorker); 
+	      Tz4 = T5 ;
+	checkTraveltime(-2,2,1, T5);
+
+    checkTraveltime(-2,2,0, FIM(T4,T1,min(T2,T5) , Slowness[posWorker.x-2][posWorker.y+2][ posWorker.z ] ));   
+    checkTraveltime(-2,2,0, SPR(-2,2,0, posWorker));
+	
+	// -----------------
+	
+	      T3  = SPR(-1,0,0, posWorker);
+	checkTraveltime(-1,0,0, T3);
+	 
+	      T2  = Tz8 ; 
+	      T5  = SPR(-2,0,1, posWorker); 
+	      Tz8 = T5 ;
+	checkTraveltime(-2,0,1,  T5);
+	
+	checkTraveltime(-2,0,0, FIM(T3,min(Tt1, T1),min(T2,T5), Slowness[posWorker.x-2][posWorker.y][ posWorker.z ] )); 
+    checkTraveltime(-2,0,0, SPR(-2,0,0, posWorker));
+    
+ 
+    // As 2D,   END:: Level z =  0 ------------------------------------------
+    // As 2D, START:: Level z = +1 ------------------------------------------
+    
+    // Comparing neighbor (With edge reduction)
+	// For node (i,j,1) except (0,0,1) 
+	for(int j = -radius_Y ; j<=radius_Y ; ++j )
+	{
+		for(int i = -radius_X ; i <= radius_X ; ++i )
+		{
+		    if( GCD(i,j)==1 )
+		    {
+                checkTraveltime(i,j,1, SPR(i,j,1, posWorker));
+		    }
+		}
+	}
+    
+    // As 2D,   END:: Level z = +1 ------------------------------------------
+    // As 2D, START:: Level z = +2 ------------------------------------------
+
+          Tt1 = SPR(-2,-1,2, posWorker); 
+    checkTraveltime(-2,-1,2, Tt1); 
+
+	checkTraveltime(-1,-1,2, SPR(-1,-1,2, posWorker));	
+
+	      T1  = SPR(-1,-2,2, posWorker); 
+	checkTraveltime(-1,-2,2,  T1);	
+
+	checkTraveltime(-2,-2,2, FIM(T1,Tt1,Tz1, Slowness[posWorker.x-2][posWorker.y-2][ posWorker.z+2 ] ));
+	checkTraveltime(-2,-2,2, SPR(-2,-2,2, posWorker));
+	
+	// -----------------
+	
+	      T2  = SPR(0,-1,2, posWorker); 
+	      Te1 = T2 ; 
+	checkTraveltime(0,-1,2,  T2);
+
+	      T3  = SPR(1,-2,2, posWorker); 
+	checkTraveltime(1,-2,2,  T3);
+
+    checkTraveltime(0,-2,2, FIM(min(T1,T3),T2,Tz5 , Slowness[posWorker.x][posWorker.y-2][ posWorker.z+2 ] ));
+    checkTraveltime(0,-2,2, SPR(0,-2,2, posWorker));
+
+    // -----------------
+
+	checkTraveltime(1,-1,2, SPR(1,-1,2, posWorker));
+	
+	      T1  = SPR(2,-1,2, posWorker); 
+	checkTraveltime(2,-1,2,  T1);
+	
+    checkTraveltime(2,-2,2, FIM(T3,T1,Tz2 , Slowness[posWorker.x+2][posWorker.y-2][ posWorker.z+2 ] ));   
+    checkTraveltime(2,-2,2, SPR(2,-2,2, posWorker));
+	
+	// -----------------
+	 
+	      T2  = SPR(1,0,2, posWorker); 
+	      Te2 = T2 ; 
+	checkTraveltime(1,0,2,  T2);
+	
+	      T3  = SPR(2,1,2, posWorker); 
+	checkTraveltime(2,1,2,  T3);
+
+    checkTraveltime(2,0,2, FIM(T2,min(T1,T3),Tz6 , Slowness[posWorker.x+2][posWorker.y][ posWorker.z+2 ] ));   
+    checkTraveltime(2,0,2, SPR(2,0,2, posWorker));
+ 
+    // -----------------
+
+	checkTraveltime(1,1,2, SPR(1,1,2, posWorker));
+	
+	      T1  = SPR(1,2,2, posWorker); 
+	checkTraveltime(1,2,2,  T1);
+	
+
+    checkTraveltime(2,2,2, FIM(T1,T3,Tz3 , Slowness[posWorker.x+2][posWorker.y+2][ posWorker.z+2 ] ));   
+    checkTraveltime(2,2,2, SPR(2,2,2, posWorker));
+   
+    // -----------------
+   
+	      T2  = SPR( 0,1,2, posWorker); 
+	      Te3 = T2 ; 
+	checkTraveltime( 0,1,2, T2);
+	
+	      T3  = SPR(-1,2,2, posWorker); 
+	checkTraveltime(-1,2,2, T3);
+
+    checkTraveltime( 0,2,2, FIM(min(T1,T3),T2,Tz7 , Slowness[posWorker.x][posWorker.y+2][ posWorker.z+2 ] ));   
+    checkTraveltime( 0,2,2, SPR(0,2,2, posWorker));
+   
+    // -----------------
+	
+	checkTraveltime(-1,1,2, SPR(-1,1,2, posWorker));
+	
+	      T1  = SPR(-2,1,2, posWorker); 
+	checkTraveltime(-2,1,2, T1);
+
+    checkTraveltime(-2,2,2, FIM(T3,T1,Tz4 , Slowness[posWorker.x-2][posWorker.y+2][ posWorker.z+2 ] ));   
+    checkTraveltime(-2,2,2, SPR(-2,2,2, posWorker));
+	
+	// -----------------
+	
+	      T2  = SPR(-1,0,2, posWorker); 
+	checkTraveltime(-1,0,2, T2);
+	
+	checkTraveltime(-2,0,2, FIM(T2,min(T1,Tt1),Tz8 , Slowness[posWorker.x-2][posWorker.y][ posWorker.z+2 ] ));   
+    checkTraveltime(-2,0,2, SPR(-2,0,2, posWorker));
+    
+    // -----------------
+    // Special node (0,0)	
+   
+          T4  = SPR(0,0,1, posWorker);
+    checkTraveltime(0,0,1, T4);
+    	
+    checkTraveltime(0,0,2, FIM(min(T2,Te2),min(Te1,Te3),T4 , Slowness[posWorker.x][posWorker.y][ posWorker.z+2 ] )); 
+	checkTraveltime(0,0,2, SPR(0,0,2, posWorker));
+
+
+    // As 2D, END:: Level z = +2 --------------------------------------------
+ 
+	//-----------------------------------------------------------------------
+	
+    // End:: Comparing neighbor != (0,0,0) ***************************************
+
+		
+	// Write outTraveltime
+	imageStore( outTraveltime, ivec3( gl_GlobalInvocationID+shift ), vec4( Tt, 0,0,0) );
+
+	// if threadUpdate -> isAnyUpdated = true ;
+	if( rayPath != -100 ){
+        isAnyUpdated = true ;
+        imageStore( RaypathMap, ivec3( gl_GlobalInvocationID ), ivec4( rayPath, 0,0,0) );
+	}
+
+}
+
+void main()
+{
+
+	/// Need update ?
+	if( gl_LocalInvocationIndex==0 ){
+	    needUpdate   = false ;	   
+		isAnyUpdated = false ;
+	}
+	memoryBarrierShared(); barrier();
+	if(  all(lessThan( gl_LocalInvocationID, uvec3(3,3,3) ))  ){
+	    if( bool( imageLoad( inUpdate, ivec3(gl_WorkGroupID+gl_LocalInvocationID) ).x ) ){
+	        needUpdate = true ;
+	    }
+	}
+	memoryBarrierShared(); barrier();
+	if( !needUpdate ){ return; }
+
+
+
+	/// Upload Slowness x8 and Traveltime x8 to shared memory
+	uploadShared();
+	memoryBarrierShared(); barrier();
+
+	/// Compare New and Old traveltime
+	compareTraveltime();
+	memoryBarrierShared(); barrier();
+
+
+
+	/// IsUpdate ? -> update running and UpdateMap.
+	if( gl_LocalInvocationIndex==0 ){
+        if( isAnyUpdated ){
+            ++ssbo.running ;
+            //atomicAdd(ssbo.running,1);
+        }
+		imageStore( outUpdate, ivec3(gl_WorkGroupID)+ivec3(1,1,1) ,  ivec4( isAnyUpdated,0,0,0) );
+	}
+
+
+}

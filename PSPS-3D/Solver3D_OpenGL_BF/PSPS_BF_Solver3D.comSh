@@ -1,0 +1,312 @@
+/*************************************
+     Parallel Shortest path solver
+             developed by
+ Somrath Kanoksirirath
+ Fourth year physics student,
+ Faculty of Science,
+ Mahidol University, Thailand.
+*************************************/
+
+#version 430 core
+layout(local_size_x=BLOCK_X, local_size_y=BLOCK_Y, local_size_z=BLOCK_Z) in;
+
+// Check std::replace at PSPS_OpenGL_3D_Solver.Init()
+#define shared_X SHARED_X
+#define shared_Y SHARED_Y
+#define shared_Z SHARED_Z
+#define group_X  GROUP_X
+#define group_Y  GROUP_Y
+#define group_Z  GROUP_Z
+#define radius_X RADIUS_X
+#define radius_Y RADIUS_Y
+#define radius_Z RADIUS_Z
+#define scale_X STRIDE_X
+#define scale_Y STRIDE_Y
+#define scale_Z STRIDE_Z
+
+// Data Maps
+layout(binding = 0, r32f) readonly uniform  image3D SlownessMap ;
+layout(binding = 1, r32f) readonly uniform  image3D inTraveltime ;
+layout(binding = 2, r32i) readonly uniform iimage3D inUpdate ;
+
+layout(binding = 3, r32f) writeonly uniform  image3D outTraveltime ;
+layout(binding = 4, r32i) writeonly uniform iimage3D outUpdate ;
+layout(binding = 5, r32i) writeonly uniform iimage3D RaypathMap ;
+
+layout(std430, binding = 6) buffer SSBO{
+     int running ;
+} ssbo ;
+
+// Constant values
+ivec3 shift = ivec3( radius_X, radius_Y, radius_Z) ;
+
+
+/***** Main program *****/
+
+shared bool isAnyUpdated ;
+shared bool needUpdate  ;
+shared float Slowness[shared_X][shared_Y][shared_Z] ;
+shared float Traveltime[shared_X][shared_Y][shared_Z] ;
+
+// Upload Slowness x8 and Traveltime x8 to shared memory
+void uploadShared()
+{
+	// (1,1,1)
+    ivec3    ptrMap = ivec3( gl_GlobalInvocationID ) ;
+    ivec3 ptrShared = ivec3( gl_LocalInvocationID ) ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ] = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	// (2,1,1)
+       ptrMap.x += 2*shift.x ;
+	ptrShared.x += 2*shift.x ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	 // (2,2,1)
+	   ptrMap.y += 2*shift.y ;
+	ptrShared.y += 2*shift.y ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	 // (1,2,1)
+       ptrMap.x -= 2*shift.x ;
+	ptrShared.x -= 2*shift.x ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	/*********************************************************/
+	
+	// (1,2,2)
+	   ptrMap.z += 2*shift.z ;
+	ptrShared.z += 2*shift.z ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	// (2,2,2)
+       ptrMap.x += 2*shift.x ;
+	ptrShared.x += 2*shift.x ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	 // (2,1,1)
+	   ptrMap.y -= 2*shift.y ;
+	ptrShared.y -= 2*shift.y ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+
+	 // (1,1,1)
+       ptrMap.x -= 2*shift.x ;
+	ptrShared.x -= 2*shift.x ;
+	  Slowness[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptrShared.x ][ ptrShared.y ][ ptrShared.z ]  = imageLoad( inTraveltime, ptrMap ).x ;
+	
+}
+
+// Calculate Weight (Slowness*LineWeight)
+float findWeight(in const int ix, in const int iy, in const int iz, in const ivec3 Source) // (ix,iy,iz) = relative directional vector wrt. source(posOnShmem)
+{
+	int nX = abs(ix), nY = abs(iy), nZ = abs(iz) ;
+	
+	const vec3  fVec   =  vec3( ix, iy, iz) ;
+	const vec3  stride =  vec3( 1.0f/nX, 1.0f/nY, 1.0f/nZ ) ;
+	
+    float crossX = 1.0f - 0.5f*stride.x ;  
+	float crossY = 1.0f - 0.5f*stride.y ;  
+	float crossZ = 1.0f - 0.5f*stride.z ;
+	
+	float crossOld = 1.0f ;
+	float Weight = 0 ;
+
+	// Main process
+	while( 0 < nX || 0 < nY || 0 < nZ )
+	{
+		int next = 2 ;
+        if( crossY < crossX ){            
+            if( crossZ < crossX ){ next = 0 ; }
+        }else{
+            if( crossZ < crossY ){ next = 1 ; }
+        }
+
+		// Find the next largest crossing point wrt. crossOld	 
+		if( next==0 ){
+			
+			// Compute weight.
+			ivec3 index = Source + ivec3( round( 0.5f*(crossOld+crossX)*fVec ) ) ;
+			Weight += Slowness[index.x][index.y][index.z]*(crossOld-crossX) ;
+
+			// For next crossing point.
+			crossOld = crossX ;
+			--nX ;
+			crossX -= stride.x ;
+			
+		}else{
+		    if( next==1 ){
+			
+			// Compute weight.
+			ivec3 index = Source + ivec3( round( 0.5f*(crossOld+crossY)*fVec ) ) ;
+			Weight += Slowness[index.x][index.y][index.z]*(crossOld-crossY) ;
+
+			// For next crossing point.
+			crossOld = crossY ;
+			--nY ;
+			crossY -= stride.y ;
+			
+			}else{
+			// if next == 2 
+			
+			// Compute weight.
+			ivec3 index = Source + ivec3( round( 0.5f*(crossOld+crossZ)*fVec ) ) ;
+			Weight += Slowness[index.x][index.y][index.z]*(crossOld-crossZ) ;
+
+			// For next crossing point.
+			crossOld = crossZ ;
+			--nZ ;
+			crossZ -= stride.z ;
+		
+		    }
+        }
+		
+	}
+	
+	// Weight at source
+	Weight += Slowness[Source.x][Source.y][Source.z]*crossOld ;
+    Weight *= length( vec3( ix*scale_X , iy*scale_Y, iz*scale_Z ) ) ;
+
+return Weight ;}
+
+/// Compare New and Old traveltime
+void compareTraveltime()
+{
+	const ivec3 posWorker = ivec3(gl_LocalInvocationID) + shift ; // posWorker on shMem
+	float Tt = Traveltime[posWorker.x][posWorker.y][posWorker.z] ;
+	int rayPath = -100 ;
+    const ivec2 stride = ivec2(group_X, group_Y) ;
+
+	/********************************************************/
+	
+	// Comparing neighbor != (0,0,0)
+
+	// k<0
+	for(int k = -radius_Z ; k < 0 ; ++k)
+	for(int j = -radius_Y ; j <= radius_Y ; ++j )
+	for(int i = -radius_X ; i <= radius_X ; ++i )
+	{
+		float newTt = Traveltime[ posWorker.x+i ][ posWorker.y+j ][ posWorker.z+k ] + findWeight( i,j,k , posWorker) ;
+		if( newTt<Tt ){
+			Tt = newTt ;
+			rayPath = ( (shift.z+k)*stride.y + (shift.y+j) )*stride.x + (shift.x+i) ;
+		}
+	}
+		
+		
+	// j<0, k= 0
+	const int k = 0 ;
+	for(int j = -radius_Y ; j<0 ; ++j )
+	for(int i = -radius_X ; i <= radius_X ; ++i )
+	{
+		float newTt = Traveltime[ posWorker.x+i ][ posWorker.y+j ][ posWorker.z+k ] + findWeight( i,j,k , posWorker) ;
+		if( newTt<Tt ){
+			Tt = newTt ;
+			rayPath = ( (shift.z+k)*stride.y + (shift.y+j) )*stride.x + (shift.x+i) ;
+		}
+	}
+	
+
+	// i<0, j=0, k=0
+	const int j = 0 ;
+	for(int i = -radius_X ; i < 0 ; ++i )
+	{
+		float newTt = Traveltime[ posWorker.x+i ][ posWorker.y+j ][ posWorker.z+k ] + findWeight( i,j,k , posWorker) ;
+		if( newTt<Tt ){
+			Tt = newTt ;
+			rayPath = ( (shift.z+k)*stride.y + (shift.y+j) )*stride.x + (shift.x+i) ;
+		}
+	}
+	// 0<i, j=0, k=0
+	for(int i = 1 ; i <= radius_X ; ++i )
+	{
+		float newTt = Traveltime[ posWorker.x+i ][ posWorker.y+j ][ posWorker.z+k ] + findWeight( i,j,k , posWorker) ;
+		if( newTt<Tt ){
+			Tt = newTt ;
+			rayPath = ( (shift.z+k)*stride.y + (shift.y+j) )*stride.x + (shift.x+i) ;
+		}
+	}
+
+    // 0<j, k=0
+	for(int j = 1 ; j <= radius_Y ; ++j )
+	for(int i = -radius_X ; i <= radius_X ; ++i )
+	{
+		float newTt = Traveltime[ posWorker.x+i ][ posWorker.y+j ][ posWorker.z+k ] + findWeight( i,j,k , posWorker) ;
+		if( newTt<Tt ){
+			Tt = newTt ;
+			rayPath = ( (shift.z+k)*stride.y + (shift.y+j) )*stride.x + (shift.x+i) ;
+		}
+	}
+
+	
+	// 0<k
+	for(int k = 1 ; k <= radius_Z ; ++k)
+	for(int j = -radius_Y ; j <= radius_Y ; ++j )
+	for(int i = -radius_X ; i <= radius_X ; ++i )
+	{
+		float newTt = Traveltime[ posWorker.x+i ][ posWorker.y+j ][ posWorker.z+k ] + findWeight( i,j,k , posWorker) ;
+		if( newTt<Tt ){
+			Tt = newTt ;
+			rayPath = ( (shift.z+k)*stride.y + (shift.y+j) )*stride.x + (shift.x+i) ;
+		}
+	}
+	
+	/********************************************************/
+		
+	// Write outTraveltime
+	imageStore( outTraveltime, ivec3( gl_GlobalInvocationID+shift ), vec4( Tt, 0,0,0) );
+
+	// if threadUpdate -> isAnyUpdated = true ;
+	if( rayPath != -100 ){
+        isAnyUpdated = true ;
+        imageStore( RaypathMap, ivec3( gl_GlobalInvocationID ), ivec4( rayPath, 0,0,0) );
+	}
+
+}
+
+void main()
+{
+
+	/// Need update ?
+	if( gl_LocalInvocationIndex==0 ){
+	    needUpdate   = false ;	   
+		isAnyUpdated = false ;
+	}
+	memoryBarrierShared(); barrier();
+	if(  all(lessThan( gl_LocalInvocationID, uvec3(3,3,3) ))  ){
+	    if( bool( imageLoad( inUpdate, ivec3(gl_WorkGroupID+gl_LocalInvocationID) ).x ) ){
+	        needUpdate = true ;
+	    }
+	}
+	memoryBarrierShared(); barrier();
+	if( !needUpdate ){ return; }
+
+
+
+	/// Upload Slowness x8 and Traveltime x8 to shared memory
+	uploadShared();
+	memoryBarrierShared(); barrier();
+
+	/// Compare New and Old traveltime
+	compareTraveltime();
+	memoryBarrierShared(); barrier();
+
+
+
+	/// IsUpdate ? -> update running and UpdateMap.
+	if( gl_LocalInvocationIndex==0 ){
+        if( isAnyUpdated ){
+            ++ssbo.running ;
+            //atomicAdd(ssbo.running,1);
+        }
+		imageStore( outUpdate, ivec3(gl_WorkGroupID)+ivec3(1,1,1),  ivec4( isAnyUpdated,0,0,0) );
+	}
+
+
+}

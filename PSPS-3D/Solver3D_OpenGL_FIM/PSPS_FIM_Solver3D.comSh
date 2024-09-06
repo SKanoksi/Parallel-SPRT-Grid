@@ -1,0 +1,154 @@
+/*************************************
+     Parallel Shortest path solver
+             developed by
+ Somrath Kanoksirirath
+ Fourth year physics student,
+ Faculty of Science,
+ Mahidol University, Thailand.
+*************************************/
+
+#version 430 core
+layout(local_size_x=BLOCK_X, local_size_y=BLOCK_Y, local_size_z=BLOCK_Z) in;
+
+// Check std::replace at PSPS_OpenGL_3D_Solver.Init()
+#define shared_X SHARED_X
+#define shared_Y SHARED_Y
+#define shared_Z SHARED_Z
+#define block_X BLock_X
+#define block_Y BLock_Y
+#define block_Z BLock_Z
+#define IterPerBlock ITERPERBLOCK
+
+// Data Maps
+layout(binding = 0, r32f) readonly uniform  image3D SlownessMap ;
+layout(binding = 1, r32f) readonly uniform  image3D inTraveltime ;
+layout(binding = 2, r32i) readonly uniform iimage3D inUpdate ;
+
+layout(binding = 3, r32f) writeonly uniform  image3D outTraveltime ;
+layout(binding = 4, r32i) writeonly uniform iimage3D outUpdate ;
+
+layout(std430, binding = 6) buffer SSBO{
+     int running ;
+} ssbo ;
+
+// Constant values
+//ivec3 shift = ivec3( radius_X, radius_Y, radius_Z) ;
+
+
+/***** Main program *****/
+
+shared bool isAnyUpdated ;
+shared bool needUpdate  ;
+shared float Slowness[shared_X][shared_Y][shared_Z] ;
+shared float Traveltime[shared_X][shared_Y][shared_Z] ;
+
+void main()
+{
+
+	/// Need update ?
+	if( gl_LocalInvocationIndex==0 ){
+	    needUpdate   = false ;	   
+		isAnyUpdated = false ;
+	}
+	memoryBarrierShared(); barrier();
+	if(  all(lessThan( gl_LocalInvocationID, uvec3(3,3,3) )) && 
+	     ( all(equal(gl_LocalInvocationID.xy,uvec2(1,1))) || 
+	       all(equal(gl_LocalInvocationID.xz,uvec2(1,1))) || 
+	       all(equal(gl_LocalInvocationID.yz,uvec2(1,1))) ) 
+	){
+	    if( bool( imageLoad( inUpdate, ivec3(gl_WorkGroupID+gl_LocalInvocationID) ).x ) ){
+	        needUpdate = true ;
+	    }
+	}
+	memoryBarrierShared(); barrier();
+	if( !needUpdate ){ return; }
+
+
+    /// Upload Slowness and Traveltime to shared memory
+    const ivec3 ptrMap = ivec3( gl_GlobalInvocationID ) + ivec3(1,1,1) ;
+    const ivec3 ptr    = ivec3( gl_LocalInvocationID )  + ivec3(1,1,1) ;
+	  Slowness[ ptr.x ][ ptr.y ][ ptr.z ] = imageLoad(  SlownessMap, ptrMap ).x ;
+	Traveltime[ ptr.x ][ ptr.y ][ ptr.z ] = imageLoad( inTraveltime, ptrMap ).x ;
+	if( ptr.x == 1  )
+	    Traveltime[ 0 ][ ptr.y ][ ptr.z ]         = imageLoad( inTraveltime, ivec3(ptrMap.x-1,ptrMap.y,ptrMap.z) ).x ;
+	if( ptr.x == block_X )
+	    Traveltime[ block_X+1 ][ ptr.y ][ ptr.z ] = imageLoad( inTraveltime, ivec3(ptrMap.x+1,ptrMap.y,ptrMap.z) ).x ;
+	if( ptr.y == 1  )
+	    Traveltime[ ptr.x ][ 0 ][ ptr.z ]         = imageLoad( inTraveltime, ivec3(ptrMap.x,ptrMap.y-1,ptrMap.z) ).x ;
+	if( ptr.y == block_Y )
+	    Traveltime[ ptr.x ][ block_Y+1 ][ ptr.z ] = imageLoad( inTraveltime, ivec3(ptrMap.x,ptrMap.y+1,ptrMap.z) ).x ;
+    if( ptr.z == 1  )
+	    Traveltime[ ptr.x ][ ptr.y ][ 0 ]         = imageLoad( inTraveltime, ivec3(ptrMap.x,ptrMap.y,ptrMap.z-1) ).x ;
+	if( ptr.z == block_Z )
+	    Traveltime[ ptr.x ][ ptr.y ][ block_Z+1 ] = imageLoad( inTraveltime, ivec3(ptrMap.x,ptrMap.y,ptrMap.z+1) ).x ;
+	    
+    memoryBarrierShared(); barrier(); // ###
+
+	
+	/// Get TT, Tx, Ty, Tz, S 
+	float TT, Tx, Ty, Tz, S ;
+	// TT, X
+	 S =   Slowness[ ptr.x ][ ptr.y ][ ptr.z ] ;
+	TT = Traveltime[ ptr.x ][ ptr.y ][ ptr.z ] ;
+	
+	/// Compare New and Old traveltime
+	// IterPerBlock 
+	int i ;
+	for( i=0 ; i<IterPerBlock ; ++i )
+	{
+	    Tx = min( Traveltime[ ptr.x-1 ][ ptr.y ][ ptr.z ], Traveltime[ ptr.x+1 ][ ptr.y ][ ptr.z ] );
+	    Ty = min( Traveltime[ ptr.x ][ ptr.y-1 ][ ptr.z ], Traveltime[ ptr.x ][ ptr.y+1 ][ ptr.z ] );
+	    Tz = min( Traveltime[ ptr.x ][ ptr.y ][ ptr.z-1 ], Traveltime[ ptr.x ][ ptr.y ][ ptr.z+1 ] );
+	    	    
+	    memoryBarrierShared(); barrier(); // ###
+	    
+	    /// Calculate new traveltime 
+	    // hx = hy Version, already included in S (adding and removing dummy vertices)
+	    // Let Tx > Ty > Tz
+	    float temp ;
+	    if(Tx < Ty){ temp = Tx ; Tx = Ty ; Ty = temp ; }
+	    if(Ty < Tz){ temp = Ty ; Ty = Tz ; Tz = temp ; }
+	    if(Tx < Ty){ temp = Tx ; Tx = Ty ; Ty = temp ; }
+
+	    float newTT = Tz + S ;
+	    if( 1.414213f*S > Ty-Tz) 
+	    {	
+	        temp = 0.5f*( (Ty+Tz) + sqrt( 2.0f*pow(S,2) - pow(Ty-Tz,2) ) ) ;
+	        bool checkFurther = true ;
+		    if(temp > Ty){ newTT = temp; }else{ checkFurther = false ; } // Inner temp is smaller.
+		    float tt ;
+		    if( checkFurther && 0 < ( tt=(3.0f*pow(S,2) -pow(Tx-Ty,2)-pow(Tx-Tz,2)-pow(Ty-Tz,2)) ) )
+		    {			
+			    temp = ( (Tx+Ty+Tz) + sqrt(tt) )/3.0f; 
+			    if(temp > Tx){ newTT = temp ; }
+		    }
+	    }
+
+    	if( TT-newTT > 1e-10*newTT ) // Update, if less and relative change is more than 1e-10.
+	    {
+    	    TT = newTT ;
+	        Traveltime[ ptr.x ][ ptr.y ][ ptr.z ] = TT ;
+	        //if( ptr.x==1 || ptr.x==block_X || ptr.y==1 || ptr.y==block_Y || ptr.z==1 || ptr.z==block_Z )
+	            isAnyUpdated = true ;  
+	    }
+	    
+	    memoryBarrierShared(); barrier(); // ###
+	
+	}
+	
+	// Write outTraveltime
+	imageStore( outTraveltime, ptrMap, vec4( TT, 0,0,0) );
+
+
+
+	/// IsUpdate ? -> update running and UpdateMap.
+	if( gl_LocalInvocationIndex==0 ){
+        if( isAnyUpdated ){
+            ++ssbo.running ;
+            //atomicAdd(ssbo.running,1);
+        }
+		imageStore( outUpdate, ivec3(gl_WorkGroupID)+ivec3(1,1,1),  ivec4( isAnyUpdated,0,0,0) );
+	}
+
+
+}
